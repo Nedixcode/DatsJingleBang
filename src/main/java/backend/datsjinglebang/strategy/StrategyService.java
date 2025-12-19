@@ -27,6 +27,15 @@ public class StrategyService {
     private final Map<String, Integer> successfulBombs = new HashMap<>(); // Счетчик успешных бомб
     private final Map<String, Integer> lastBombTick = new HashMap<>(); // Тик последней установки бомбы
 
+    // Новые поля для отслеживания убегания от мин
+    private final Map<String, Integer> escapeTicks = new HashMap<>(); // Сколько тиков убегаем
+    private final Map<String, int[]> escapeFromPos = new HashMap<>(); // Откуда убегаем
+    private final Map<String, int[]> escapeDirection = new HashMap<>(); // Направление убегания
+
+    // Константы
+    private static final int BOMB_RADIUS = 1;      // Радиус взрыва бомбы (только соседние клетки)
+    private static final int BOMBER_VISION = 5;    // Радиус обзора бомбера (5 клеток)
+
     public MoveRequest decideMove(ArenaResponse arena, BoosterResponse boosters) {
         tickCounter++;
 
@@ -51,6 +60,28 @@ public class StrategyService {
 
             updateCooldown(bomber.id);
             updateAggressionLevel(bomber.id, arena); // Обновляем уровень агрессии
+
+            // Проверяем, нужно ли продолжать убегать от бомбы
+            if (shouldContinueEscaping(bomber.id, arena)) {
+                lastAction.put(bomber.id, "ESCAPE");
+                MoveBomber escapeCommand = continueBombEscape(bomber, arena);
+                if (escapeCommand != null) {
+                    commands.add(escapeCommand);
+                    logBomberAction(bomber, escapeCommand);
+                }
+                continue;
+            }
+
+            // Проверяем, не находимся ли мы в опасной зоне взрыва
+            if (isInDangerZone(bomber.pos, arena)) {
+                lastAction.put(bomber.id, "DANGER_ESCAPE");
+                MoveBomber dangerEscape = escapeFromDanger(bomber, arena);
+                if (dangerEscape != null) {
+                    commands.add(dangerEscape);
+                    logBomberAction(bomber, dangerEscape);
+                }
+                continue;
+            }
 
             MoveBomber command = createSmartBombCommand(bomber, arena);
             if (command != null) {
@@ -86,6 +117,7 @@ public class StrategyService {
             aggressionLevel.put(bomberId, 50);
             successfulBombs.put(bomberId, 0);
             lastBombTick.put(bomberId, 0);
+            escapeTicks.put(bomberId, 0);
         }
 
         // Увеличиваем агрессию если давно не ставили бомбы
@@ -108,6 +140,7 @@ public class StrategyService {
                 aggressionLevel.put(bomber.id, baseAggression);
                 successfulBombs.put(bomber.id, 0);
                 lastBombTick.put(bomber.id, 0);
+                escapeTicks.put(bomber.id, 0);
 
                 log.info("🎯 Bomber {} assigned to group {}, direction {}, aggression {}",
                         bomber.id, bomberGroup.get(bomber.id),
@@ -119,11 +152,10 @@ public class StrategyService {
     private MoveBomber createSmartBombCommand(Bomber bomber, ArenaResponse arena) {
         int[] currentPos = bomber.pos;
 
-        // ПОВЫШЕННЫЙ ПРИОРИТЕТ: Проверяем возможность поставить бомбу у стены или рядом с врагом
-        if (shouldPlantBombAggressively(bomber, arena)) {
-            lastAction.put(bomber.id, "BOMB");
-            lastBombTick.put(bomber.id, tickCounter);
-            return plantBombAndEscape(bomber, arena);
+        // Проверяем, не находимся ли мы на бомбе или рядом с ней
+        if (isOnBomb(currentPos, arena) || isNextToBomb(currentPos, arena)) {
+            lastAction.put(bomber.id, "ESCAPE_BOMB");
+            return escapeFromBombImmediately(bomber, arena);
         }
 
         // Проверяем, не слишком ли мы близко к другим бомберам
@@ -132,11 +164,18 @@ public class StrategyService {
             return spreadOut(bomber, arena);
         }
 
+        // ПОВЫШЕННЫЙ ПРИОРИТЕТ: Проверяем возможность поставить бомбу у стены или рядом с врагом
+        if (shouldPlantBombAggressively(bomber, arena)) {
+            lastAction.put(bomber.id, "BOMB");
+            lastBombTick.put(bomber.id, tickCounter);
+            return plantBombAndEscapeSafely(bomber, arena);
+        }
+
         // Проверяем, можем ли поставить бомбу СЕЙЧАС (оригинальная логика)
         if (canPlaceBombAtTarget(bomber, currentPos, arena)) {
             lastAction.put(bomber.id, "BOMB");
             lastBombTick.put(bomber.id, tickCounter);
-            return plantBombAndEscape(bomber, arena);
+            return plantBombAndEscapeSafely(bomber, arena);
         }
 
         // Если только что поставили бомбу - продолжаем убегать
@@ -153,7 +192,7 @@ public class StrategyService {
             return moveToBombPlacement(bomber, bombTarget, arena);
         }
 
-        // Ищем ближайшую цель ДЛЯ ЭТОГО БОМБЕРА
+        // Ищем ближайшую цель ДЛЯ ЭТОГО БОМБЕРА в радиусе обзора
         int[] target = findIndividualTarget(bomber, arena);
 
         if (target != null) {
@@ -161,9 +200,461 @@ public class StrategyService {
             return moveToTarget(bomber, target, arena);
         }
 
-        // Если нет целей - патрулируем в своей зоне, ища места для мин
+        // Если нет целей в радиусе обзора - патрулируем в своей зоне, ища места для мин
         lastAction.put(bomber.id, "PATROL");
         return patrolAndSearchForBombSpots(bomber, arena);
+    }
+
+    // НОВЫЙ МЕТОД: Проверяет, нужно ли продолжать убегать
+    private boolean shouldContinueEscaping(String bomberId, ArenaResponse arena) {
+        Integer escapeTicksCount = escapeTicks.get(bomberId);
+        if (escapeTicksCount == null || escapeTicksCount <= 0) {
+            return false;
+        }
+
+        // Уменьшаем счетчик убегания
+        escapeTicks.put(bomberId, escapeTicksCount - 1);
+
+        // Если еще не убежали достаточно далеко, продолжаем
+        int[] escapeFrom = escapeFromPos.get(bomberId);
+        if (escapeFrom == null) {
+            escapeTicks.put(bomberId, 0);
+            return false;
+        }
+
+        Bomber bomber = findBomberById(bomberId, arena);
+        if (bomber == null) {
+            escapeTicks.put(bomberId, 0);
+            return false;
+        }
+
+        // Проверяем расстояние от точки, откуда убегаем
+        int distance = Math.abs(bomber.pos[0] - escapeFrom[0]) + Math.abs(bomber.pos[1] - escapeFrom[1]);
+
+        // Если убежали на 4+ клетки, можно прекращать
+        if (distance >= 4) {
+            escapeTicks.put(bomberId, 0);
+            return false;
+        }
+
+        // Если все еще в опасной зоне, продолжаем
+        if (isInDangerZone(bomber.pos, arena)) {
+            return true;
+        }
+
+        // Убегаем минимум 3 тика
+        return escapeTicksCount > 0;
+    }
+
+    // НОВЫЙ МЕТОД: Убегание от опасной зоны
+    private MoveBomber escapeFromDanger(Bomber bomber, ArenaResponse arena) {
+        int[] currentPos = bomber.pos;
+        List<List<Integer>> path = new ArrayList<>();
+        path.add(Arrays.asList(currentPos[0], currentPos[1]));
+
+        log.info("🚨 Bomber {} in DANGER ZONE! Escaping immediately!", bomber.id);
+
+        // Ищем самое безопасное направление (подальше от бомб)
+        int[] safeDirection = findSafestEscapeDirection(currentPos, arena);
+        if (safeDirection != null) {
+            int newX = currentPos[0] + safeDirection[0];
+            int newY = currentPos[1] + safeDirection[1];
+
+            if (isValidCell(newX, newY, arena) && !isObstacle(newX, newY, arena)) {
+                path.add(Arrays.asList(newX, newY));
+
+                // Пробуем убежать на 2 клетки
+                int nextX = newX + safeDirection[0];
+                int nextY = newY + safeDirection[1];
+                if (isValidCell(nextX, nextY, arena) && !isObstacle(nextX, nextY, arena)) {
+                    path.add(Arrays.asList(nextX, nextY));
+                }
+            }
+        }
+
+        // Если не нашли безопасного направления, идем в любую сторону
+        if (path.size() == 1) {
+            int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
+            for (int[] dir : directions) {
+                int newX = currentPos[0] + dir[0];
+                int newY = currentPos[1] + dir[1];
+                if (isValidCell(newX, newY, arena) && !isObstacle(newX, newY, arena)) {
+                    path.add(Arrays.asList(newX, newY));
+                    break;
+                }
+            }
+        }
+
+        return new MoveBomber(bomber.id, path, new ArrayList<>());
+    }
+
+    // НОВЫЙ МЕТОД: Находит самое безопасное направление для убегания
+    private int[] findSafestEscapeDirection(int[] from, ArenaResponse arena) {
+        int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
+        int[] safestDir = null;
+        int maxSafetyScore = -1000;
+
+        for (int[] dir : directions) {
+            int safetyScore = 0;
+
+            // Проверяем 3 клетки в этом направлении
+            for (int i = 1; i <= 3; i++) {
+                int checkX = from[0] + dir[0] * i;
+                int checkY = from[1] + dir[1] * i;
+
+                if (!isValidCell(checkX, checkY, arena)) {
+                    safetyScore -= 50; // Вне карты - плохо
+                    break;
+                }
+
+                if (isObstacle(checkX, checkY, arena)) {
+                    safetyScore -= 30; // Препятствие - плохо
+                    break;
+                }
+
+                if (isOnBomb(new int[]{checkX, checkY}, arena)) {
+                    safetyScore -= 100; // Бомба - очень плохо
+                }
+
+                if (isNextToBomb(new int[]{checkX, checkY}, arena)) {
+                    safetyScore -= 50; // Рядом с бомбой - плохо
+                }
+
+                // Бонус за расстояние от бомб
+                int bombDistance = getMinDistanceToBomb(checkX, checkY, arena);
+                safetyScore += bombDistance * 10;
+
+                // Бонус за открытое пространство
+                if (!isObstacle(checkX, checkY, arena)) {
+                    safetyScore += 5;
+                }
+            }
+
+            if (safetyScore > maxSafetyScore) {
+                maxSafetyScore = safetyScore;
+                safestDir = dir;
+            }
+        }
+
+        return safestDir;
+    }
+
+    // НОВЫЙ МЕТОД: Получает минимальное расстояние до бомбы
+    private int getMinDistanceToBomb(int x, int y, ArenaResponse arena) {
+        if (arena.arena == null || arena.arena.bombs == null) {
+            return 10; // Нет бомб - безопасно
+        }
+
+        int minDistance = Integer.MAX_VALUE;
+        for (Bomb bomb : arena.arena.bombs) {
+            if (bomb.pos == null || bomb.pos.length < 2) continue;
+
+            int distance = Math.abs(bomb.pos[0] - x) + Math.abs(bomb.pos[1] - y);
+            if (distance < minDistance) {
+                minDistance = distance;
+            }
+        }
+
+        return minDistance == Integer.MAX_VALUE ? 10 : minDistance;
+    }
+
+    // НОВЫЙ МЕТОД: Проверяет, рядом ли с позицией есть бомба
+    private boolean isNextToBomb(int[] pos, ArenaResponse arena) {
+        if (arena.arena == null || arena.arena.bombs == null) return false;
+
+        for (Bomb bomb : arena.arena.bombs) {
+            if (bomb.pos == null || bomb.pos.length < 2) continue;
+
+            int distance = Math.abs(bomb.pos[0] - pos[0]) + Math.abs(bomb.pos[1] - pos[1]);
+            if (distance <= 1) { // Бомба в соседней клетке
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ИСПРАВЛЕННЫЙ МЕТОД: Проверяет, находимся ли в опасной зоне (в радиусе взрыва бомбы по кресту)
+    private boolean isInDangerZone(int[] pos, ArenaResponse arena) {
+        if (arena.arena == null || arena.arena.bombs == null) return false;
+
+        for (Bomb bomb : arena.arena.bombs) {
+            if (bomb.pos == null || bomb.pos.length < 2) continue;
+
+            // Проверяем только по кресту (вертикаль и горизонталь)
+            if (bomb.pos[0] == pos[0]) { // Одинаковая X координата - вертикальная линия
+                int minY = Math.min(bomb.pos[1], pos[1]);
+                int maxY = Math.max(bomb.pos[1], pos[1]);
+                boolean clearPath = true;
+
+                // Проверяем клетки между бомбой и позицией
+                for (int y = minY + 1; y < maxY; y++) {
+                    if (isWall(bomb.pos[0], y, arena) || isObstacle(bomb.pos[0], y, arena)) {
+                        clearPath = false;
+                        break;
+                    }
+                }
+
+                if (clearPath && Math.abs(bomb.pos[1] - pos[1]) <= BOMB_RADIUS) {
+                    return true;
+                }
+            }
+
+            if (bomb.pos[1] == pos[1]) { // Одинаковая Y координата - горизонтальная линия
+                int minX = Math.min(bomb.pos[0], pos[0]);
+                int maxX = Math.max(bomb.pos[0], pos[0]);
+                boolean clearPath = true;
+
+                // Проверяем клетки между бомбой и позицией
+                for (int x = minX + 1; x < maxX; x++) {
+                    if (isWall(x, bomb.pos[1], arena) || isObstacle(x, bomb.pos[1], arena)) {
+                        clearPath = false;
+                        break;
+                    }
+                }
+
+                if (clearPath && Math.abs(bomb.pos[0] - pos[0]) <= BOMB_RADIUS) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // НОВЫЙ МЕТОД: Немедленно убегает от бомбы
+    private MoveBomber escapeFromBombImmediately(Bomber bomber, ArenaResponse arena) {
+        int[] currentPos = bomber.pos;
+        List<List<Integer>> path = new ArrayList<>();
+        path.add(Arrays.asList(currentPos[0], currentPos[1]));
+
+        log.warn("💥 Bomber {} ON or NEXT TO BOMB! Emergency escape!", bomber.id);
+
+        // Ищем любое направление для побега
+        int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
+        for (int[] dir : directions) {
+            int newX = currentPos[0] + dir[0];
+            int newY = currentPos[1] + dir[1];
+
+            if (isValidCell(newX, newY, arena) && !isObstacle(newX, newY, arena)) {
+                path.add(Arrays.asList(newX, newY));
+
+                // Пробуем убежать на 2 клетки
+                int nextX = newX + dir[0];
+                int nextY = newY + dir[1];
+                if (isValidCell(nextX, nextY, arena) && !isObstacle(nextX, nextY, arena)) {
+                    path.add(Arrays.asList(nextX, nextY));
+                }
+                break;
+            }
+        }
+
+        return new MoveBomber(bomber.id, path, new ArrayList<>());
+    }
+
+    // НОВЫЙ МЕТОД: Ставит бомбу и безопасно убегает
+    private MoveBomber plantBombAndEscapeSafely(Bomber bomber, ArenaResponse arena) {
+        int[] currentPos = bomber.pos;
+
+        // Проверяем, есть ли безопасный путь для отступления
+        List<List<Integer>> escapePath = findSafeEscapePathFromBomb(currentPos, arena);
+
+        if (escapePath.size() <= 1) {
+            // Нет безопасного пути - не ставим бомбу
+            log.warn("⚠️ Bomber {}: No safe escape path, skipping bomb", bomber.id);
+            lastAction.put(bomber.id, "ABORT_BOMB");
+            return patrolInZone(bomber, arena);
+        }
+
+        // Ставим бомбу
+        List<List<Integer>> bombs = new ArrayList<>();
+        bombs.add(Arrays.asList(currentPos[0], currentPos[1]));
+        bombCooldown.put(bomber.id, 6);
+
+        // Увеличиваем счетчик успешных бомб и агрессию
+        int currentBombs = successfulBombs.getOrDefault(bomber.id, 0);
+        successfulBombs.put(bomber.id, currentBombs + 1);
+
+        int currentAggression = aggressionLevel.getOrDefault(bomber.id, 50);
+        aggressionLevel.put(bomber.id, Math.min(100, currentAggression + 10));
+
+        // Запоминаем, что мы убегаем от бомбы
+        escapeTicks.put(bomber.id, 4); // Убегаем 4 тика
+        escapeFromPos.put(bomber.id, currentPos);
+
+        // Определяем направление убегания (первый шаг пути)
+        if (escapePath.size() > 1) {
+            List<Integer> firstStep = escapePath.get(1);
+            int dx = firstStep.get(0) - currentPos[0];
+            int dy = firstStep.get(1) - currentPos[1];
+            escapeDirection.put(bomber.id, new int[]{dx, dy});
+        }
+
+        log.info("💣💣💣 Bomber {} PLANTING BOMB at ({},{}) - ESCAPING SAFELY! (Aggression: {}, Total bombs: {})",
+                bomber.id, currentPos[0], currentPos[1],
+                aggressionLevel.get(bomber.id), successfulBombs.get(bomber.id));
+
+        return new MoveBomber(bomber.id, escapePath, bombs);
+    }
+
+    // НОВЫЙ МЕТОД: Продолжает убегать от бомбы
+    private MoveBomber continueBombEscape(Bomber bomber, ArenaResponse arena) {
+        int[] currentPos = bomber.pos;
+        List<List<Integer>> path = new ArrayList<>();
+        path.add(Arrays.asList(currentPos[0], currentPos[1]));
+
+        // Продолжаем двигаться в том же направлении
+        int[] escapeDir = escapeDirection.get(bomber.id);
+        if (escapeDir != null) {
+            int newX = currentPos[0] + escapeDir[0];
+            int newY = currentPos[1] + escapeDir[1];
+
+            if (isValidCell(newX, newY, arena) && !isObstacle(newX, newY, arena)) {
+                path.add(Arrays.asList(newX, newY));
+
+                // Если можем, идем еще на одну клетку
+                int nextX = newX + escapeDir[0];
+                int nextY = newY + escapeDir[1];
+                if (isValidCell(nextX, nextY, arena) && !isObstacle(nextX, nextY, arena)) {
+                    path.add(Arrays.asList(nextX, nextY));
+                }
+            } else {
+                // Если не можем идти в том же направлении, ищем новое
+                return findAlternativeEscapePath(bomber, arena);
+            }
+        } else {
+            // Если нет направления, ищем новый путь
+            return findAlternativeEscapePath(bomber, arena);
+        }
+
+        return new MoveBomber(bomber.id, path, new ArrayList<>());
+    }
+
+    // НОВЫЙ МЕТОД: Находит альтернативный путь для убегания
+    private MoveBomber findAlternativeEscapePath(Bomber bomber, ArenaResponse arena) {
+        int[] currentPos = bomber.pos;
+        List<List<Integer>> path = new ArrayList<>();
+        path.add(Arrays.asList(currentPos[0], currentPos[1]));
+
+        // Ищем любое безопасное направление
+        int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
+        for (int[] dir : directions) {
+            int newX = currentPos[0] + dir[0];
+            int newY = currentPos[1] + dir[1];
+
+            if (isValidCell(newX, newY, arena) && !isObstacle(newX, newY, arena)) {
+                path.add(Arrays.asList(newX, newY));
+                break;
+            }
+        }
+
+        return new MoveBomber(bomber.id, path, new ArrayList<>());
+    }
+
+    // НОВЫЙ МЕТОД: Находит безопасный путь для отступления от бомбы
+    private List<List<Integer>> findSafeEscapePathFromBomb(int[] from, ArenaResponse arena) {
+        List<List<Integer>> path = new ArrayList<>();
+        path.add(Arrays.asList(from[0], from[1]));
+
+        int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
+
+        // Оцениваем каждое направление по безопасности
+        List<int[]> safeDirections = new ArrayList<>();
+
+        for (int[] dir : directions) {
+            boolean isSafe = true;
+            List<int[]> escapeCells = new ArrayList<>();
+
+            // Проверяем 3 клетки в этом направлении
+            for (int i = 1; i <= 3; i++) {
+                int checkX = from[0] + dir[0] * i;
+                int checkY = from[1] + dir[1] * i;
+
+                if (!isValidCell(checkX, checkY, arena) || isObstacle(checkX, checkY, arena)) {
+                    isSafe = false;
+                    break;
+                }
+
+                // Проверяем, нет ли здесь других бомб
+                if (isOnBomb(new int[]{checkX, checkY}, arena)) {
+                    isSafe = false;
+                    break;
+                }
+
+                escapeCells.add(new int[]{checkX, checkY});
+            }
+
+            if (isSafe && !escapeCells.isEmpty()) {
+                // Оцениваем безопасность направления
+                int safetyScore = 0;
+                for (int[] cell : escapeCells) {
+                    // Бонус за расстояние от начальной точки
+                    int distance = Math.abs(cell[0] - from[0]) + Math.abs(cell[1] - from[1]);
+                    safetyScore += distance * 10;
+
+                    // Бонус за отсутствие других бомб поблизости
+                    if (!isNextToBomb(cell, arena)) {
+                        safetyScore += 20;
+                    }
+                }
+                safeDirections.add(new int[]{dir[0], dir[1], safetyScore});
+            }
+        }
+
+        if (!safeDirections.isEmpty()) {
+            // Выбираем самое безопасное направление
+            safeDirections.sort((a, b) -> Integer.compare(b[2], a[2]));
+            int[] bestDir = safeDirections.get(0);
+
+            // Добавляем 3 клетки в пути
+            for (int i = 1; i <= 3; i++) {
+                int newX = from[0] + bestDir[0] * i;
+                int newY = from[1] + bestDir[1] * i;
+                path.add(Arrays.asList(newX, newY));
+            }
+            return path;
+        }
+
+        // Если нет полностью безопасного пути, ищем на 2 клетки
+        for (int[] dir : directions) {
+            int step1X = from[0] + dir[0];
+            int step1Y = from[1] + dir[1];
+            int step2X = step1X + dir[0];
+            int step2Y = step1Y + dir[1];
+
+            if (isValidCell(step1X, step1Y, arena) && !isObstacle(step1X, step1Y, arena) &&
+                    isValidCell(step2X, step2Y, arena) && !isObstacle(step2X, step2Y, arena) &&
+                    !isOnBomb(new int[]{step1X, step1Y}, arena) && !isOnBomb(new int[]{step2X, step2Y}, arena)) {
+                path.add(Arrays.asList(step1X, step1Y));
+                path.add(Arrays.asList(step2X, step2Y));
+                return path;
+            }
+        }
+
+        // Если нет на 2 клетки, ищем на 1 клетку
+        for (int[] dir : directions) {
+            int newX = from[0] + dir[0];
+            int newY = from[1] + dir[1];
+
+            if (isValidCell(newX, newY, arena) && !isObstacle(newX, newY, arena) &&
+                    !isOnBomb(new int[]{newX, newY}, arena)) {
+                path.add(Arrays.asList(newX, newY));
+                return path;
+            }
+        }
+
+        log.warn("⚠️ No safe escape path found from bomb!");
+        return path; // Остаемся на месте
+    }
+
+    // НОВЫЙ МЕТОД: Находит бомбера по ID
+    private Bomber findBomberById(String bomberId, ArenaResponse arena) {
+        if (arena.bombers == null) return null;
+
+        for (Bomber bomber : arena.bombers) {
+            if (bomber.id.equals(bomberId)) {
+                return bomber;
+            }
+        }
+        return null;
     }
 
     // НОВЫЙ МЕТОД: Проверяет, нужно ли агрессивно ставить бомбу
@@ -178,6 +669,11 @@ public class StrategyService {
             return false;
         }
         if (isOnBomb(currentPos, arena)) {
+            return false;
+        }
+
+        // Дополнительная проверка: не рядом ли с другой бомбой
+        if (isNextToBomb(currentPos, arena)) {
             return false;
         }
 
@@ -264,7 +760,7 @@ public class StrategyService {
         return false;
     }
 
-    // НОВЫЙ МЕТОД: Проверяет, есть ли рядом стена и враг в радиусе взрыва
+    // ИСПРАВЛЕННЫЙ МЕТОД: Проверяет, есть ли рядом стена и враг в радиусе взрыва (по кресту)
     private boolean isNextToWallAndEnemyInRange(int[] pos, ArenaResponse arena) {
         if (!isNextToAnyWall(pos, arena)) return false;
         if (arena.enemies == null) return false;
@@ -272,12 +768,46 @@ public class StrategyService {
         for (Enemy enemy : arena.enemies) {
             if (enemy.pos == null) continue;
 
-            int dist = Math.abs(enemy.pos[0] - pos[0]) + Math.abs(enemy.pos[1] - pos[1]);
-            // Враг в радиусе 3 клеток (радиус взрыва бомбы)
-            if (dist <= 3) {
-                // Проверяем, нет ли стены между нами
-                if (isClearPathForBomb(pos, enemy.pos, arena)) {
-                    return true;
+            // Проверяем только по кресту (вертикаль и горизонталь)
+            if (enemy.pos[0] == pos[0]) { // Одинаковая X координата - вертикальная линия
+                int distance = Math.abs(enemy.pos[1] - pos[1]);
+                if (distance <= BOMB_RADIUS && distance > 0) {
+                    int minY = Math.min(enemy.pos[1], pos[1]);
+                    int maxY = Math.max(enemy.pos[1], pos[1]);
+                    boolean clearPath = true;
+
+                    // Проверяем клетки между врагом и позицией
+                    for (int y = minY + 1; y < maxY; y++) {
+                        if (isWall(pos[0], y, arena) || isObstacle(pos[0], y, arena)) {
+                            clearPath = false;
+                            break;
+                        }
+                    }
+
+                    if (clearPath) {
+                        return true;
+                    }
+                }
+            }
+
+            if (enemy.pos[1] == pos[1]) { // Одинаковая Y координата - горизонтальная линия
+                int distance = Math.abs(enemy.pos[0] - pos[0]);
+                if (distance <= BOMB_RADIUS && distance > 0) {
+                    int minX = Math.min(enemy.pos[0], pos[0]);
+                    int maxX = Math.max(enemy.pos[0], pos[0]);
+                    boolean clearPath = true;
+
+                    // Проверяем клетки между врагом и позицией
+                    for (int x = minX + 1; x < maxX; x++) {
+                        if (isWall(x, pos[1], arena) || isObstacle(x, pos[1], arena)) {
+                            clearPath = false;
+                            break;
+                        }
+                    }
+
+                    if (clearPath) {
+                        return true;
+                    }
                 }
             }
         }
@@ -311,10 +841,10 @@ public class StrategyService {
         int[] currentPos = bomber.pos;
         int aggression = aggressionLevel.getOrDefault(bomber.id, 50);
 
-        // При высоком уровне агрессии ищем любые стены поблизости
+        // При высоком уровне агрессии ищем любые стены поблизости (в радиусе обзора)
         if (aggression > 60) {
-            // Ищем ближайшую стену для минирования
-            int[] nearestWall = findNearestWall(currentPos, arena, 10); // Радиус поиска 10 клеток
+            // Ищем ближайшую стену для минирования в радиусе обзора
+            int[] nearestWall = findNearestWall(currentPos, arena, BOMBER_VISION);
             if (nearestWall != null) {
                 log.debug("Bomber {} targeting wall at ({},{}) for bombing",
                         bomber.id, nearestWall[0], nearestWall[1]);
@@ -322,13 +852,13 @@ public class StrategyService {
             }
         }
 
-        // Ищем позиции, где можно поставить бомбу чтобы достать несколько целей
+        // Ищем позиции, где можно поставить бомбу чтобы достать несколько целей (в радиусе обзора)
         int[] multiTargetSpot = findMultiTargetBombSpot(bomber, arena);
         if (multiTargetSpot != null) {
             return multiTargetSpot;
         }
 
-        // Ищем врагов рядом со стенами
+        // Ищем врагов рядом со стенами (в радиусе обзора)
         int[] enemyNearWall = findEnemyNearWall(currentPos, arena);
         if (enemyNearWall != null) {
             return enemyNearWall;
@@ -387,12 +917,12 @@ public class StrategyService {
         return false;
     }
 
-    // НОВЫЙ МЕТОД: Находит позицию для бомбы, которая достанет несколько целей
+    // ИСПРАВЛЕННЫЙ МЕТОД: Находит позицию для бомбы, которая достанет несколько целей (по кресту)
     private int[] findMultiTargetBombSpot(Bomber bomber, ArenaResponse arena) {
         int[] currentPos = bomber.pos;
 
-        // Ищем клетки в радиусе 5, где можно поставить бомбу
-        for (int radius = 1; radius <= 5; radius++) {
+        // Ищем клетки в радиусе ОБЗОРА (5 клеток), где можно поставить бомбу
+        for (int radius = 1; radius <= BOMBER_VISION; radius++) {
             for (int dx = -radius; dx <= radius; dx++) {
                 for (int dy = -radius; dy <= radius; dy++) {
                     if (Math.abs(dx) + Math.abs(dy) <= radius) {
@@ -405,12 +935,12 @@ public class StrategyService {
                             continue;
                         }
 
-                        // Оцениваем позицию для бомбы
-                        int score = calculateBombSpotScore(checkX, checkY, arena);
+                        // Оцениваем позицию для бомбы (только по кресту, радиус 1)
+                        int score = calculateBombSpotScoreCross(checkX, checkY, arena);
 
                         // Если хорошая позиция (много целей)
                         if (score >= 3) { // Минимум 3 цели (стены или враги)
-                            log.debug("Found multi-target bomb spot at ({},{}) with score {}",
+                            log.debug("Found multi-target bomb spot at ({},{}) with cross score {}",
                                     checkX, checkY, score);
                             return new int[]{checkX, checkY};
                         }
@@ -422,34 +952,31 @@ public class StrategyService {
         return null;
     }
 
-    // НОВЫЙ МЕТОД: Оценивает позицию для установки бомбы
-    private int calculateBombSpotScore(int x, int y, ArenaResponse arena) {
+    // ИСПРАВЛЕННЫЙ МЕТОД: Оценивает позицию для установки бомбы (по кресту)
+    private int calculateBombSpotScoreCross(int x, int y, ArenaResponse arena) {
         int score = 0;
-        int bombRadius = 3; // Предполагаемый радиус взрыва
 
-        // Проверяем все клетки в радиусе взрыва
-        for (int dx = -bombRadius; dx <= bombRadius; dx++) {
-            for (int dy = -bombRadius; dy <= bombRadius; dy++) {
-                if (Math.abs(dx) + Math.abs(dy) <= bombRadius) {
-                    int checkX = x + dx;
-                    int checkY = y + dy;
+        // Проверяем только соседние клетки по кресту (радиус взрыва = 1)
+        int[][] directions = {{0, -1}, {0, 1}, {-1, 0}, {1, 0}}; // Вверх, вниз, влево, вправо
 
-                    if (!isValidCell(checkX, checkY, arena)) continue;
+        for (int[] dir : directions) {
+            int checkX = x + dir[0];
+            int checkY = y + dir[1];
 
-                    // Стены в радиусе взрыва
-                    if (isWall(checkX, checkY, arena)) {
-                        score += 2; // Стены дают больше очков
-                    }
+            if (!isValidCell(checkX, checkY, arena)) continue;
 
-                    // Враги в радиусе взрыва
-                    if (arena.enemies != null) {
-                        for (Enemy enemy : arena.enemies) {
-                            if (enemy.pos != null &&
-                                    enemy.pos[0] == checkX && enemy.pos[1] == checkY) {
-                                score += 3; // Враги дают еще больше очков
-                                break;
-                            }
-                        }
+            // Стены в радиусе взрыва
+            if (isWall(checkX, checkY, arena)) {
+                score += 2;
+            }
+
+            // Враги в радиусе взрыва
+            if (arena.enemies != null) {
+                for (Enemy enemy : arena.enemies) {
+                    if (enemy.pos != null &&
+                            enemy.pos[0] == checkX && enemy.pos[1] == checkY) {
+                        score += 3;
+                        break;
                     }
                 }
             }
@@ -458,25 +985,64 @@ public class StrategyService {
         return score;
     }
 
-    // НОВЫЙ МЕТОД: Находит врага рядом со стеной
+    // Старый метод оставлен для совместимости
+    private int calculateBombSpotScore(int x, int y, ArenaResponse arena) {
+        return calculateBombSpotScoreCross(x, y, arena);
+    }
+
+    // ИСПРАВЛЕННЫЙ МЕТОД: Находит врага рядом со стеной
     private int[] findEnemyNearWall(int[] from, ArenaResponse arena) {
         if (arena.enemies == null) return null;
 
         for (Enemy enemy : arena.enemies) {
             if (enemy.pos == null) continue;
 
+            int distance = Math.abs(enemy.pos[0] - from[0]) + Math.abs(enemy.pos[1] - from[1]);
+
+            // Проверяем только врагов в радиусе ОБЗОРА
+            if (distance > BOMBER_VISION) continue;
+
             // Проверяем, есть ли стены рядом с врагом
             if (isNextToAnyWall(enemy.pos, arena)) {
-                // Возвращаем позицию рядом с врагом (для установки бомбы)
-                int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
-                for (int[] dir : directions) {
-                    int bombX = enemy.pos[0] + dir[0];
-                    int bombY = enemy.pos[1] + dir[1];
+                // Ищем позицию для бомбы, которая достанет врага и стену
+                int[][] bombPositions = {
+                        {enemy.pos[0] + 1, enemy.pos[1]},
+                        {enemy.pos[0] - 1, enemy.pos[1]},
+                        {enemy.pos[0], enemy.pos[1] + 1},
+                        {enemy.pos[0], enemy.pos[1] - 1}
+                };
 
-                    if (isValidCell(bombX, bombY, arena) &&
-                            !isObstacle(bombX, bombY, arena) &&
-                            !isOnBomb(new int[]{bombX, bombY}, arena)) {
-                        return new int[]{bombX, bombY};
+                for (int[] bombPos : bombPositions) {
+                    if (isValidCell(bombPos[0], bombPos[1], arena) &&
+                            !isObstacle(bombPos[0], bombPos[1], arena) &&
+                            !isOnBomb(new int[]{bombPos[0], bombPos[1]}, arena)) {
+
+                        // Проверяем, что бомба достанет и врага и стену (радиус 1)
+                        boolean hitsEnemy = false;
+                        boolean hitsWall = false;
+
+                        // Проверяем соседние клетки по кресту от позиции бомбы
+                        int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
+                        for (int[] dir : directions) {
+                            int checkX = bombPos[0] + dir[0];
+                            int checkY = bombPos[1] + dir[1];
+
+                            if (!isValidCell(checkX, checkY, arena)) continue;
+
+                            // Проверяем, есть ли враг в соседней клетке
+                            if (checkX == enemy.pos[0] && checkY == enemy.pos[1]) {
+                                hitsEnemy = true;
+                            }
+
+                            // Проверяем, есть ли стена в соседней клетке
+                            if (isWall(checkX, checkY, arena)) {
+                                hitsWall = true;
+                            }
+                        }
+
+                        if (hitsEnemy && hitsWall) {
+                            return bombPos;
+                        }
                     }
                 }
             }
@@ -508,11 +1074,11 @@ public class StrategyService {
         if (isNextToAnyWall(currentPos, arena) && canPlaceBombAtTarget(bomber, currentPos, arena)) {
             lastAction.put(bomber.id, "BOMB");
             lastBombTick.put(bomber.id, tickCounter);
-            return plantBombAndEscape(bomber, arena);
+            return plantBombAndEscapeSafely(bomber, arena);
         }
 
-        // Ищем ближайшую стену для патрулирования
-        int[] nearestWall = findNearestWall(currentPos, arena, 15);
+        // Ищем ближайшую стену для патрулирования в радиусе обзора
+        int[] nearestWall = findNearestWall(currentPos, arena, BOMBER_VISION);
         if (nearestWall != null) {
             log.debug("Bomber {} patrolling to wall at ({},{})",
                     bomber.id, nearestWall[0], nearestWall[1]);
@@ -523,39 +1089,24 @@ public class StrategyService {
         return patrolInZone(bomber, arena);
     }
 
-    // НОВЫЙ МЕТОД: Проверяет путь для движения (упрощенная версия)
-    private boolean isClearPathForMovement(int[] from, int[] to, ArenaResponse arena) {
-        // Проверяем линию между точками (грубая проверка)
-        int steps = Math.max(Math.abs(to[0] - from[0]), Math.abs(to[1] - from[1]));
+    // ИСПРАВЛЕННЫЙ МЕТОД: Проверяет путь для бомбы (можно через 1 клетку, только по кресту)
+    private boolean isClearPathForBomb(int[] from, int[] to, ArenaResponse arena) {
+        // Проверяем, что точки на одной линии (вертикальной или горизонтальной)
+        if (from[0] != to[0] && from[1] != to[1]) {
+            return false; // Не на одной линии - бомба не достанет
+        }
 
-        for (int i = 1; i <= steps; i++) {
-            float t = (float) i / steps;
-            int checkX = Math.round(from[0] + (to[0] - from[0]) * t);
-            int checkY = Math.round(from[1] + (to[1] - from[1]) * t);
+        int dist = Math.abs(to[0] - from[0]) + Math.abs(to[1] - from[1]);
 
-            if (!isValidCell(checkX, checkY, arena) || isObstacle(checkX, checkY, arena)) {
-                return false;
-            }
+        // Для радиуса 1 можно достать только соседние клетки
+        if (dist != 1) return false;
+
+        // Для соседних клеток проверяем только препятствия
+        if (isObstacle(to[0], to[1], arena)) {
+            return false;
         }
 
         return true;
-    }
-
-    // НОВЫЙ МЕТОД: Проверяет путь для бомбы (можно через 1 клетку)
-    private boolean isClearPathForBomb(int[] from, int[] to, ArenaResponse arena) {
-        int dist = Math.abs(to[0] - from[0]) + Math.abs(to[1] - from[1]);
-
-        if (dist <= 1) return true;
-
-        // Для расстояния 2 проверяем среднюю клетку
-        if (dist == 2) {
-            int midX = (from[0] + to[0]) / 2;
-            int midY = (from[1] + to[1]) / 2;
-            return !isWall(midX, midY, arena) && !isObstacle(midX, midY, arena);
-        }
-
-        // Для большего расстояния - упрощенная проверка
-        return isClearPathForMovement(from, to, arena);
     }
 
     private boolean isTooCloseToOtherBombers(Bomber currentBomber, ArenaResponse arena) {
@@ -645,6 +1196,7 @@ public class StrategyService {
         return count > 0 ? totalDistance / count : 0;
     }
 
+    // ИСПРАВЛЕННЫЙ МЕТОД: Ищет цель для бомбера в радиусе ОБЗОРА (5 клеток)
     private int[] findIndividualTarget(Bomber bomber, ArenaResponse arena) {
         int[] currentPos = bomber.pos;
         int groupId = bomberGroup.get(bomber.id);
@@ -683,33 +1235,34 @@ public class StrategyService {
         int[] bestTarget = null;
         int bestScore = -1;
 
-        // 1. Ищем врагов в своей зоне
+        // 1. Ищем врагов в своей зоне в радиусе ОБЗОРА
         if (arena.enemies != null) {
             for (Enemy enemy : arena.enemies) {
                 if (enemy.pos == null) continue;
 
+                // Проверяем, в радиусе ли обзора
+                int dist = Math.abs(enemy.pos[0] - currentPos[0]) +
+                        Math.abs(enemy.pos[1] - currentPos[1]);
+
+                if (dist > BOMBER_VISION) continue; // Враг вне радиуса обзора
+
                 if (enemy.pos[0] >= zoneStartX && enemy.pos[0] < zoneEndX &&
                         enemy.pos[1] >= zoneStartY && enemy.pos[1] < zoneEndY) {
 
-                    int dist = Math.abs(enemy.pos[0] - currentPos[0]) +
-                            Math.abs(enemy.pos[1] - currentPos[1]);
+                    int score = 150 - dist * 5;
+                    score += 50; // Бонус за врага в своей зоне
 
-                    if (dist <= 8) {
-                        int score = 150 - dist * 5;
-                        score += 50;
-
-                        if (score > bestScore) {
-                            bestScore = score;
-                            bestTarget = enemy.pos;
-                        }
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestTarget = enemy.pos;
                     }
                 }
             }
         }
 
-        // 2. Если в своей зоне нет врагов, ищем в других зонах
+        // 2. Если в своей зоне нет врагов, ищем в других зонах (но в радиусе обзора)
         if (bestTarget == null) {
-            bestTarget = findBestBombTarget(bomber, arena);
+            bestTarget = findBestBombTargetInVision(bomber, arena);
         }
 
         // 3. Если нашли цель, проверяем, не преследует ли ее другой бомбер
@@ -717,7 +1270,104 @@ public class StrategyService {
             log.debug("Target at ({},{}) already pursued, finding alternative",
                     bestTarget[0], bestTarget[1]);
 
-            return findAlternativeTarget(bomber, arena, bestTarget);
+            return findAlternativeTargetInVision(bomber, arena, bestTarget);
+        }
+
+        return bestTarget;
+    }
+
+    // НОВЫЙ МЕТОД: Ищет лучшую цель для бомбы в радиусе обзора
+    private int[] findBestBombTargetInVision(Bomber bomber, ArenaResponse arena) {
+        int[] currentPos = bomber.pos;
+        int[] bestTarget = null;
+        int bestScore = -1;
+
+        if (arena.enemies != null) {
+            for (Enemy enemy : arena.enemies) {
+                if (enemy.pos == null) continue;
+
+                int dist = Math.abs(enemy.pos[0] - currentPos[0]) +
+                        Math.abs(enemy.pos[1] - currentPos[1]);
+
+                // Проверяем только врагов в радиусе обзора
+                if (dist <= BOMBER_VISION) {
+                    int score = 100 - dist * 10;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestTarget = enemy.pos;
+                    }
+                }
+            }
+        }
+
+        if (bestTarget == null && arena.arena != null && arena.arena.obstacles != null) {
+            for (List<Integer> wall : arena.arena.obstacles) {
+                if (wall.size() < 2) continue;
+
+                int dist = Math.abs(wall.get(0) - currentPos[0]) +
+                        Math.abs(wall.get(1) - currentPos[1]);
+
+                // Проверяем только стены в радиусе обзора
+                if (dist <= BOMBER_VISION) {
+                    int score = 50 - dist * 5;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestTarget = new int[]{wall.get(0), wall.get(1)};
+                    }
+                }
+            }
+        }
+
+        if (bestTarget != null) {
+            log.debug("Found target in vision at ({},{}) with score {}",
+                    bestTarget[0], bestTarget[1], bestScore);
+        }
+
+        return bestTarget;
+    }
+
+    // НОВЫЙ МЕТОД: Ищет альтернативную цель в радиусе обзора
+    private int[] findAlternativeTargetInVision(Bomber bomber, ArenaResponse arena, int[] avoidTarget) {
+        int[] currentPos = bomber.pos;
+        int[] bestTarget = null;
+        int bestScore = -1;
+
+        int preferredDir = preferredDirection.get(bomber.id);
+        int[][] directionOffsets = {{1,0},{-1,0},{0,1},{0,-1}};
+        int[] mainDir = directionOffsets[preferredDir % 4];
+
+        if (arena.enemies != null) {
+            for (Enemy enemy : arena.enemies) {
+                if (enemy.pos == null) continue;
+
+                // Пропускаем целевую цель
+                if (avoidTarget != null &&
+                        enemy.pos[0] == avoidTarget[0] && enemy.pos[1] == avoidTarget[1]) {
+                    continue;
+                }
+
+                int dist = Math.abs(enemy.pos[0] - currentPos[0]) +
+                        Math.abs(enemy.pos[1] - currentPos[1]);
+
+                // Проверяем только врагов в радиусе обзора
+                if (dist <= BOMBER_VISION) {
+                    int dirBonus = 0;
+                    int dx = Integer.compare(enemy.pos[0], currentPos[0]);
+                    int dy = Integer.compare(enemy.pos[1], currentPos[1]);
+
+                    if ((dx == mainDir[0] && dy == mainDir[1]) ||
+                            (dx == -mainDir[0] && dy == -mainDir[1])) {
+                        dirBonus = 30;
+                    }
+
+                    int score = 100 - dist * 3 + dirBonus;
+
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestTarget = enemy.pos;
+                    }
+                }
+            }
         }
 
         return bestTarget;
@@ -742,50 +1392,6 @@ public class StrategyService {
         }
 
         return false;
-    }
-
-    private int[] findAlternativeTarget(Bomber bomber, ArenaResponse arena, int[] avoidTarget) {
-        int[] currentPos = bomber.pos;
-        int[] bestTarget = null;
-        int bestScore = -1;
-
-        int preferredDir = preferredDirection.get(bomber.id);
-        int[][] directionOffsets = {{1,0},{-1,0},{0,1},{0,-1}};
-        int[] mainDir = directionOffsets[preferredDir % 4];
-
-        if (arena.enemies != null) {
-            for (Enemy enemy : arena.enemies) {
-                if (enemy.pos == null) continue;
-
-                if (avoidTarget != null &&
-                        enemy.pos[0] == avoidTarget[0] && enemy.pos[1] == avoidTarget[1]) {
-                    continue;
-                }
-
-                int dist = Math.abs(enemy.pos[0] - currentPos[0]) +
-                        Math.abs(enemy.pos[1] - currentPos[1]);
-
-                if (dist <= 10) {
-                    int dirBonus = 0;
-                    int dx = Integer.compare(enemy.pos[0], currentPos[0]);
-                    int dy = Integer.compare(enemy.pos[1], currentPos[1]);
-
-                    if ((dx == mainDir[0] && dy == mainDir[1]) ||
-                            (dx == -mainDir[0] && dy == -mainDir[1])) {
-                        dirBonus = 30;
-                    }
-
-                    int score = 100 - dist * 3 + dirBonus;
-
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestTarget = enemy.pos;
-                    }
-                }
-            }
-        }
-
-        return bestTarget;
     }
 
     private MoveBomber moveToTarget(Bomber bomber, int[] target, ArenaResponse arena) {
@@ -972,28 +1578,16 @@ public class StrategyService {
         if (isOnBomb(currentPos, arena)) {
             return false;
         }
+        // Добавлена проверка на соседство с бомбой
+        if (isNextToBomb(currentPos, arena)) {
+            return false;
+        }
         return isNextToEnemy(currentPos, arena) || isNextToWall(currentPos, arena);
     }
 
     private MoveBomber plantBombAndEscape(Bomber bomber, ArenaResponse arena) {
-        int[] currentPos = bomber.pos;
-        List<List<Integer>> bombs = new ArrayList<>();
-        bombs.add(Arrays.asList(currentPos[0], currentPos[1]));
-        bombCooldown.put(bomber.id, 6);
-
-        // Увеличиваем счетчик успешных бомб и агрессию
-        int currentBombs = successfulBombs.getOrDefault(bomber.id, 0);
-        successfulBombs.put(bomber.id, currentBombs + 1);
-
-        int currentAggression = aggressionLevel.getOrDefault(bomber.id, 50);
-        aggressionLevel.put(bomber.id, Math.min(100, currentAggression + 10));
-
-        log.info("💣💣💣 Bomber {} PLANTING BOMB at ({},{}) - ESCAPING! (Aggression: {}, Total bombs: {})",
-                bomber.id, currentPos[0], currentPos[1],
-                aggressionLevel.get(bomber.id), successfulBombs.get(bomber.id));
-
-        List<List<Integer>> escapePath = findSafeEscapePath(currentPos, arena);
-        return new MoveBomber(bomber.id, escapePath, bombs);
+        // Старый метод оставлен для совместимости, но теперь использует безопасную версию
+        return plantBombAndEscapeSafely(bomber, arena);
     }
 
     // ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====
@@ -1084,10 +1678,10 @@ public class StrategyService {
                 return true;
             }
 
-            if (dist == 2) {
-                int midX = (enemy.pos[0] + pos[0]) / 2;
-                int midY = (enemy.pos[1] + pos[1]) / 2;
-                if (!isWall(midX, midY, arena)) {
+            // Для радиуса 1 нельзя достать врага через 2 клетки
+            if (dist == 2 && (enemy.pos[0] == pos[0] || enemy.pos[1] == pos[1])) {
+                // Проверяем, что между нами нет стены и нет препятствий
+                if (isClearPathForBomb(pos, enemy.pos, arena)) {
                     log.info("✅ Enemy 2 cells away at ({},{})", enemy.pos[0], enemy.pos[1]);
                     return true;
                 }
@@ -1111,6 +1705,7 @@ public class StrategyService {
                 return true;
             }
 
+            // Для радиуса 1 стена через 1 клетку по прямой тоже считается
             int checkX2 = pos[0] + dir[0] * 2;
             int checkY2 = pos[1] + dir[1] * 2;
             if (isWall(checkX2, checkY2, arena) && !isObstacle(checkX, checkY, arena)) {
@@ -1123,60 +1718,8 @@ public class StrategyService {
     }
 
     private List<List<Integer>> findSafeEscapePath(int[] from, ArenaResponse arena) {
-        List<List<Integer>> path = new ArrayList<>();
-        path.add(Arrays.asList(from[0], from[1]));
-
-        int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
-
-        for (int[] dir : directions) {
-            boolean canEscape = true;
-            List<int[]> escapeCells = new ArrayList<>();
-
-            for (int i = 1; i <= 3; i++) {
-                int checkX = from[0] + dir[0] * i;
-                int checkY = from[1] + dir[1] * i;
-
-                if (!isValidCell(checkX, checkY, arena) || isObstacle(checkX, checkY, arena)) {
-                    canEscape = false;
-                    break;
-                }
-                escapeCells.add(new int[]{checkX, checkY});
-            }
-
-            if (canEscape && !escapeCells.isEmpty()) {
-                for (int[] cell : escapeCells) {
-                    path.add(Arrays.asList(cell[0], cell[1]));
-                }
-                return path;
-            }
-        }
-
-        for (int[] dir : directions) {
-            int step1X = from[0] + dir[0];
-            int step1Y = from[1] + dir[1];
-            int step2X = step1X + dir[0];
-            int step2Y = step1Y + dir[1];
-
-            if (isValidCell(step1X, step1Y, arena) && !isObstacle(step1X, step1Y, arena) &&
-                    isValidCell(step2X, step2Y, arena) && !isObstacle(step2X, step2Y, arena)) {
-                path.add(Arrays.asList(step1X, step1Y));
-                path.add(Arrays.asList(step2X, step2Y));
-                return path;
-            }
-        }
-
-        for (int[] dir : directions) {
-            int newX = from[0] + dir[0];
-            int newY = from[1] + dir[1];
-
-            if (isValidCell(newX, newY, arena) && !isObstacle(newX, newY, arena)) {
-                path.add(Arrays.asList(newX, newY));
-                return path;
-            }
-        }
-
-        log.warn("⚠️ No escape path found!");
-        return path;
+        // Старый метод оставлен для совместимости
+        return findSafeEscapePathFromBomb(from, arena);
     }
 
     private MoveBomber continueEscaping(Bomber bomber, ArenaResponse arena) {
@@ -1265,14 +1808,23 @@ public class StrategyService {
 
     private void logBomberAction(Bomber bomber, MoveBomber command) {
         if (command.getBombs() != null && !command.getBombs().isEmpty()) {
-            log.info("🔥 Bomber {} (group {}): PLANTED BOMB and moving {} cells (Aggression: {})",
+            log.info("🔥 Bomber {} (group {}): PLANTED BOMB and moving {} cells (Aggression: {}, Escape ticks: {})",
                     bomber.id, bomberGroup.get(bomber.id),
-                    command.getPath().size() - 1, aggressionLevel.get(bomber.id));
+                    command.getPath().size() - 1, aggressionLevel.get(bomber.id),
+                    escapeTicks.getOrDefault(bomber.id, 0));
         } else {
-            log.debug("Bomber {} (group {}): Moving {} cells (action: {}, Aggression: {})",
-                    bomber.id, bomberGroup.get(bomber.id),
-                    command.getPath().size() - 1, lastAction.get(bomber.id),
-                    aggressionLevel.get(bomber.id));
+            String action = lastAction.getOrDefault(bomber.id, "UNKNOWN");
+            if (action.equals("ESCAPE") || action.equals("DANGER_ESCAPE") || action.equals("ESCAPE_BOMB")) {
+                log.info("🏃‍♂️ Bomber {} (group {}): ESCAPING {} cells (action: {}, Aggression: {})",
+                        bomber.id, bomberGroup.get(bomber.id),
+                        command.getPath().size() - 1, action,
+                        aggressionLevel.get(bomber.id));
+            } else {
+                log.debug("Bomber {} (group {}): Moving {} cells (action: {}, Aggression: {})",
+                        bomber.id, bomberGroup.get(bomber.id),
+                        command.getPath().size() - 1, action,
+                        aggressionLevel.get(bomber.id));
+            }
         }
     }
 
@@ -1293,6 +1845,9 @@ public class StrategyService {
         aggressionLevel.keySet().removeIf(id -> !aliveBomberIds.contains(id));
         successfulBombs.keySet().removeIf(id -> !aliveBomberIds.contains(id));
         lastBombTick.keySet().removeIf(id -> !aliveBomberIds.contains(id));
+        escapeTicks.keySet().removeIf(id -> !aliveBomberIds.contains(id));
+        escapeFromPos.keySet().removeIf(id -> !aliveBomberIds.contains(id));
+        escapeDirection.keySet().removeIf(id -> !aliveBomberIds.contains(id));
     }
 
     // ДОПОЛНЕНИЕ: Метод для обновления предпочтительного направления
@@ -1361,5 +1916,23 @@ public class StrategyService {
         }
 
         return null;
+    }
+
+    // Старый метод оставлен для совместимости
+    private boolean isClearPathForMovement(int[] from, int[] to, ArenaResponse arena) {
+        // Проверяем линию между точками (грубая проверка)
+        int steps = Math.max(Math.abs(to[0] - from[0]), Math.abs(to[1] - from[1]));
+
+        for (int i = 1; i <= steps; i++) {
+            float t = (float) i / steps;
+            int checkX = Math.round(from[0] + (to[0] - from[0]) * t);
+            int checkY = Math.round(from[1] + (to[1] - from[1]) * t);
+
+            if (!isValidCell(checkX, checkY, arena) || isObstacle(checkX, checkY, arena)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 }
