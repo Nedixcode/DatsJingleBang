@@ -39,10 +39,6 @@ public class StrategyService {
     public MoveRequest decideMove(ArenaResponse arena, BoosterResponse boosters) {
         tickCounter++;
 
-        if (tickCounter % 2 != 0) {
-            return null;
-        }
-
         log.debug("=== Tick {} ===", tickCounter);
 
         List<MoveBomber> commands = new ArrayList<>();
@@ -939,7 +935,7 @@ public class StrategyService {
                         int score = calculateBombSpotScoreCross(checkX, checkY, arena);
 
                         // Если хорошая позиция (много целей)
-                        if (score >= 3) { // Минимум 3 цели (стены или враги)
+                        if (score >= 2) { // Минимум 3 цели (стены или враги)
                             log.debug("Found multi-target bomb spot at ({},{}) with cross score {}",
                                     checkX, checkY, score);
                             return new int[]{checkX, checkY};
@@ -1585,59 +1581,7 @@ public class StrategyService {
         return isNextToEnemy(currentPos, arena) || isNextToWall(currentPos, arena);
     }
 
-    private MoveBomber plantBombAndEscape(Bomber bomber, ArenaResponse arena) {
-        // Старый метод оставлен для совместимости, но теперь использует безопасную версию
-        return plantBombAndEscapeSafely(bomber, arena);
-    }
-
     // ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====
-
-    private int[] findBestBombTarget(Bomber bomber, ArenaResponse arena) {
-        int[] currentPos = bomber.pos;
-        int[] bestTarget = null;
-        int bestScore = -1;
-
-        if (arena.enemies != null) {
-            for (Enemy enemy : arena.enemies) {
-                if (enemy.pos == null) continue;
-
-                int dist = Math.abs(enemy.pos[0] - currentPos[0]) +
-                        Math.abs(enemy.pos[1] - currentPos[1]);
-
-                if (dist <= 5) {
-                    int score = 100 - dist * 10;
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestTarget = enemy.pos;
-                    }
-                }
-            }
-        }
-
-        if (bestTarget == null && arena.arena != null && arena.arena.obstacles != null) {
-            for (List<Integer> wall : arena.arena.obstacles) {
-                if (wall.size() < 2) continue;
-
-                int dist = Math.abs(wall.get(0) - currentPos[0]) +
-                        Math.abs(wall.get(1) - currentPos[1]);
-
-                if (dist <= 7) {
-                    int score = 50 - dist * 5;
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestTarget = new int[]{wall.get(0), wall.get(1)};
-                    }
-                }
-            }
-        }
-
-        if (bestTarget != null) {
-            log.debug("Found target at ({},{}) with score {}",
-                    bestTarget[0], bestTarget[1], bestScore);
-        }
-
-        return bestTarget;
-    }
 
     private MoveBomber safePatrol(Bomber bomber, ArenaResponse arena) {
         int[] currentPos = bomber.pos;
@@ -1704,22 +1648,9 @@ public class StrategyService {
                 log.info("✅ Wall RIGHT NEXT to us at ({},{})", checkX, checkY);
                 return true;
             }
-
-            // Для радиуса 1 стена через 1 клетку по прямой тоже считается
-            int checkX2 = pos[0] + dir[0] * 2;
-            int checkY2 = pos[1] + dir[1] * 2;
-            if (isWall(checkX2, checkY2, arena) && !isObstacle(checkX, checkY, arena)) {
-                log.info("✅ Wall 2 cells away at ({},{})", checkX2, checkY2);
-                return true;
-            }
         }
 
         return false;
-    }
-
-    private List<List<Integer>> findSafeEscapePath(int[] from, ArenaResponse arena) {
-        // Старый метод оставлен для совместимости
-        return findSafeEscapePathFromBomb(from, arena);
     }
 
     private MoveBomber continueEscaping(Bomber bomber, ArenaResponse arena) {
@@ -1848,74 +1779,6 @@ public class StrategyService {
         escapeTicks.keySet().removeIf(id -> !aliveBomberIds.contains(id));
         escapeFromPos.keySet().removeIf(id -> !aliveBomberIds.contains(id));
         escapeDirection.keySet().removeIf(id -> !aliveBomberIds.contains(id));
-    }
-
-    // ДОПОЛНЕНИЕ: Метод для обновления предпочтительного направления
-    private void updatePreferredDirection(String bomberId, int[] currentPos, int[] targetPos) {
-        if (targetPos == null) return;
-
-        int dx = Integer.compare(targetPos[0], currentPos[0]);
-        int dy = Integer.compare(targetPos[1], currentPos[1]);
-
-        int newDirection = 0;
-        if (dx > 0) newDirection = 0;
-        else if (dx < 0) newDirection = 1;
-        else if (dy > 0) newDirection = 2;
-        else if (dy < 0) newDirection = 3;
-
-        preferredDirection.put(bomberId, newDirection);
-    }
-
-    // ДОПОЛНЕНИЕ: Метод для проверки, свободна ли клетка от других бомберов
-    private boolean isCellFreeFromOtherBombers(int x, int y, String currentBomberId, ArenaResponse arena) {
-        if (arena.bombers == null) return true;
-
-        for (Bomber other : arena.bombers) {
-            if (!other.alive || other.id.equals(currentBomberId)) {
-                continue;
-            }
-
-            if (other.pos[0] == x && other.pos[1] == y) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    // ДОПОЛНЕНИЕ: Метод для поиска ближайшего безопасного места
-    private int[] findNearestSafeSpot(int[] from, ArenaResponse arena) {
-        int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
-
-        for (int[] dir : directions) {
-            int newX = from[0] + dir[0];
-            int newY = from[1] + dir[1];
-
-            if (isValidCell(newX, newY, arena) &&
-                    !isObstacle(newX, newY, arena) &&
-                    !isOnBomb(new int[]{newX, newY}, arena)) {
-                return new int[]{newX, newY};
-            }
-        }
-
-        for (int radius = 2; radius <= 5; radius++) {
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dy = -radius; dy <= radius; dy++) {
-                    if (Math.abs(dx) + Math.abs(dy) == radius) {
-                        int newX = from[0] + dx;
-                        int newY = from[1] + dy;
-
-                        if (isValidCell(newX, newY, arena) &&
-                                !isObstacle(newX, newY, arena) &&
-                                !isOnBomb(new int[]{newX, newY}, arena)) {
-                            return new int[]{newX, newY};
-                        }
-                    }
-                }
-            }
-        }
-
-        return null;
     }
 
     // Старый метод оставлен для совместимости
