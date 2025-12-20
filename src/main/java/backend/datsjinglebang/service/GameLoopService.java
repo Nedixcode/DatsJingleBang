@@ -13,8 +13,10 @@ import reactor.core.publisher.Mono;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 public class GameLoopService {
@@ -30,6 +32,9 @@ public class GameLoopService {
     private final AtomicBoolean started = new AtomicBoolean(false);
     private final AtomicInteger tickCounter = new AtomicInteger(0);
     private final AtomicInteger totalRequests = new AtomicInteger(0);
+    private final AtomicLong lastBoosterPurchaseTime = new AtomicLong(0);
+    private final AtomicInteger totalBoostersPurchased = new AtomicInteger(0);
+    private static final long BOOSTER_PURCHASE_INTERVAL_MS = 20000; // 20 секунд
 
     public GameLoopService(GameApiClient api, StrategyService strategyService) {
         this.api = api;
@@ -44,6 +49,7 @@ public class GameLoopService {
         }
 
         log.info("Starting game loop with FIXED 500ms delays between requests");
+        log.info("Booster purchase interval: {} ms", BOOSTER_PURCHASE_INTERVAL_MS);
 
         // Запускаем бесконечный цикл правильно
         startInfiniteLoop();
@@ -81,8 +87,8 @@ public class GameLoopService {
                     return Mono.delay(Duration.ofSeconds(1)).then();
                 })
                 .doFinally(signal -> {
-                    log.info("[{}] └─── Tick #{} completed (total requests: {}) ───",
-                            tickId, tickNumber, totalRequests.get());
+                    log.info("[{}] └─── Tick #{} completed (total requests: {}, total boosters purchased: {}) ───",
+                            tickId, tickNumber, totalRequests.get(), totalBoostersPurchased.get());
                 });
     }
 
@@ -109,8 +115,15 @@ public class GameLoopService {
                             .doOnSuccess(boosters -> {
                                 int availableCount = boosters.getAvailable() != null ?
                                         boosters.getAvailable().size() : 0;
+                                BoosterState state = boosters.getState();
                                 log.info("[{}] │ ✓ GET /booster: available={}, points={}",
-                                        tickId, availableCount, boosters.getState().getPoints());
+                                        tickId, availableCount, state.getPoints());
+
+                                // Подробный лог текущих характеристик
+                                logBoosterState(state, tickId);
+
+                                // Проверяем, нужно ли покупать бустеры
+                                checkAndPurchaseBooster(boosters, tickId);
                             })
                             .doOnError(e -> log.error("[{}] │ ✗ GET /booster failed: {}", tickId, e.getMessage()))
                             .delayElement(Duration.ofMillis(500))
@@ -141,6 +154,168 @@ public class GameLoopService {
                 .then();
     }
 
+    // НОВЫЙ МЕТОД: Логирует текущее состояние бустеров
+    private void logBoosterState(BoosterState state, String tickId) {
+        log.info("[{}] │ 📊 Current stats: ⚡Speed={}, 💣Bombs={}, 🎯Range={}, 👁️View={}, 🛡️Armor={}, ⏱️Delay={}",
+                tickId,
+                state.getSpeed(),
+                state.getBombs(),
+                state.getBombRange(),
+                state.getView(),
+                state.getArmor(),
+                state.getBombDelay());
+
+        if (state.isCanPassBombs() || state.isCanPassObstacles() || state.isCanPassWalls()) {
+            log.info("[{}] │ 🚀 Special abilities: PassBombs={}, PassObstacles={}, PassWalls={}",
+                    tickId,
+                    state.isCanPassBombs() ? "✓" : "✗",
+                    state.isCanPassObstacles() ? "✓" : "✗",
+                    state.isCanPassWalls() ? "✓" : "✗");
+        }
+    }
+
+    // НОВЫЙ МЕТОД: Проверяет и покупает бустеры
+    private void checkAndPurchaseBooster(BoosterResponse boosters, String tickId) {
+        long currentTime = System.currentTimeMillis();
+        long lastPurchaseTime = lastBoosterPurchaseTime.get();
+
+        // Проверяем, прошло ли 20 секунд с последней покупки
+        if (currentTime - lastPurchaseTime < BOOSTER_PURCHASE_INTERVAL_MS) {
+            long secondsSinceLastPurchase = (currentTime - lastPurchaseTime) / 1000;
+            log.info("[{}] │ ⏳ Last booster purchase was {} seconds ago (need {} seconds)",
+                    tickId, secondsSinceLastPurchase, BOOSTER_PURCHASE_INTERVAL_MS / 1000);
+            return;
+        }
+
+        if (boosters.getAvailable() == null || boosters.getAvailable().isEmpty()) {
+            log.info("[{}] │ 🚫 No boosters available for purchase", tickId);
+            lastBoosterPurchaseTime.set(currentTime); // Обновляем время, чтобы не проверять каждый раз
+            return;
+        }
+
+        int points = boosters.getState().getPoints();
+        List<Booster> availableBoosters = boosters.getAvailable();
+
+        // Логируем доступные бустеры
+        logAvailableBoosters(availableBoosters, points, tickId);
+
+        // Выбираем лучший бустер для покупки
+        Booster bestBooster = null;
+        int bestPriority = -1;
+
+        for (Booster booster : availableBoosters) {
+            if (booster.getCost() <= points) {
+                int priority = getBoosterPriority(booster.getType());
+                if (priority > bestPriority) {
+                    bestPriority = priority;
+                    bestBooster = booster;
+                }
+            }
+        }
+
+        if (bestBooster != null) {
+            log.info("[{}] │ 🛒 Attempting to purchase booster: {} (cost: {}, priority: {})",
+                    tickId, bestBooster.getType(), bestBooster.getCost(), bestPriority);
+
+            // Покупаем бустер
+            PurchaseBoosterRequest purchaseRequest = new PurchaseBoosterRequest(bestBooster.getType());
+            Booster finalBestBooster = bestBooster;
+            api.purchaseBooster(purchaseRequest)
+                    .doOnSubscribe(s -> log.info("[{}] │ Sending POST /booster (request #{})",
+                            tickId, totalRequests.incrementAndGet()))
+                    .doOnSuccess(response -> {
+                        log.info("[{}] │ ✅ POST /booster SUCCESSFUL: purchased {} for {} points",
+                                tickId, finalBestBooster.getType(), finalBestBooster.getCost());
+                        // Обновляем время последней покупки
+                        lastBoosterPurchaseTime.set(currentTime);
+                        // Увеличиваем счетчик купленных бустеров
+                        totalBoostersPurchased.incrementAndGet();
+
+                        // Логируем общую статистику
+                        log.info("[{}] │ 🎉 TOTAL BOOSTERS PURCHASED: {}", tickId, totalBoostersPurchased.get());
+                    })
+                    .doOnError(e -> {
+                        log.error("[{}] │ ❌ POST /booster FAILED: {}", tickId, e.getMessage());
+                        // Все равно обновляем время при ошибке, чтобы не зациклиться
+                        lastBoosterPurchaseTime.set(currentTime);
+                    })
+                    .subscribe();
+        } else {
+            int cheapestCost = getCheapestBoosterCost(availableBoosters);
+            log.info("[{}] │ 💰 No affordable boosters (points: {}, cheapest booster cost: {})",
+                    tickId, points, cheapestCost);
+
+            // Логируем сколько не хватает
+            if (points < cheapestCost) {
+                int needed = cheapestCost - points;
+                log.info("[{}] │ 📈 Need {} more points to buy cheapest booster", tickId, needed);
+            }
+
+            // Обновляем время, чтобы не проверять каждый тик
+            lastBoosterPurchaseTime.set(currentTime);
+        }
+    }
+
+    // НОВЫЙ МЕТОД: Логирует доступные бустеры
+    private void logAvailableBoosters(List<Booster> boosters, int points, String tickId) {
+        if (boosters == null || boosters.isEmpty()) {
+            log.info("[{}] │ 📋 Available boosters: NONE", tickId);
+            return;
+        }
+
+        log.info("[{}] │ 📋 Available boosters ({} points available):", tickId, points);
+        for (Booster booster : boosters) {
+            boolean canAfford = booster.getCost() <= points;
+            int priority = getBoosterPriority(booster.getType());
+            log.info("[{}] │   - {}: {} points (affordable: {}, priority: {})",
+                    tickId, booster.getType(), booster.getCost(),
+                    canAfford ? "✓" : "✗", priority);
+        }
+    }
+
+    // Вспомогательный метод: получает стоимость самого дешевого бустера
+    private int getCheapestBoosterCost(List<Booster> boosters) {
+        if (boosters == null || boosters.isEmpty()) {
+            return Integer.MAX_VALUE;
+        }
+
+        int minCost = Integer.MAX_VALUE;
+        for (Booster booster : boosters) {
+            if (booster.getCost() < minCost) {
+                minCost = booster.getCost();
+            }
+        }
+        return minCost;
+    }
+
+    // НОВЫЙ МЕТОД: Определяет приоритет бустеров
+    private int getBoosterPriority(String boosterType) {
+        if (boosterType == null) return 1;
+
+        switch (boosterType.toLowerCase()) {
+            case "bombs":
+                return 10; // Самый высокий приоритет - больше бомб
+            case "speed":
+                return 9;  // Скорость
+            case "bomb_range":
+                return 8;  // Радиус взрыва
+            case "view":
+                return 7;  // Обзор
+            case "armor":
+                return 6;  // Броня
+            case "bomb_delay":
+                return 5;  // Задержка бомбы
+            case "can_pass_bombs":
+                return 4;  // Проход через бомбы
+            case "can_pass_obstacles":
+                return 3;  // Проход через препятствия
+            case "can_pass_walls":
+                return 2;  // Проход через стены
+            default:
+                return 1;
+        }
+    }
+
     private void validateAndFixCommands(MoveRequest request) {
         if (request == null || request.getBombers() == null) return;
 
@@ -153,5 +328,20 @@ public class GameLoopService {
                         bomber.getId(), maxPathLength);
             }
         }
+    }
+
+    // Метод для получения статистики (можно использовать для мониторинга)
+    public void printBoosterStatistics() {
+        long currentTime = System.currentTimeMillis();
+        long lastPurchaseTime = lastBoosterPurchaseTime.get();
+        long secondsSinceLastPurchase = (currentTime - lastPurchaseTime) / 1000;
+
+        log.info("=== BOOSTER STATISTICS ===");
+        log.info("Total boosters purchased: {}", totalBoostersPurchased.get());
+        log.info("Seconds since last purchase: {}", secondsSinceLastPurchase);
+        log.info("Next purchase in: {} seconds",
+                Math.max(0, BOOSTER_PURCHASE_INTERVAL_MS/1000 - secondsSinceLastPurchase));
+        log.info("Total API requests made: {}", totalRequests.get());
+        log.info("=========================");
     }
 }

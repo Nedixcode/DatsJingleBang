@@ -41,7 +41,16 @@ public class GameApiClient {
                 .bodyToMono(BoosterResponse.class);
     }
 
-    // Применение бустера
+    // НОВЫЙ МЕТОД: Покупка бустера
+    public Mono<Void> purchaseBooster(PurchaseBoosterRequest request) {
+        return client.post()
+                .uri("/booster")
+                .bodyValue(request)
+                .retrieve()
+                .bodyToMono(Void.class);
+    }
+
+    // Применение бустера (возможно, это то же самое что и purchaseBooster)
     public Mono<ApplyBoosterResponse> applyBooster(String boosterType) {
         ApplyBoosterRequest request = new ApplyBoosterRequest();
         request.setBooster(boosterType);
@@ -53,7 +62,7 @@ public class GameApiClient {
                 .bodyToMono(ApplyBoosterResponse.class);
     }
 
-    // Получение логов - ИСПРАВЛЕНО!
+    // Получение логов
     public Mono<List<LogEntry>> getLogs() {
         return client.get()
                 .uri("/logs")
