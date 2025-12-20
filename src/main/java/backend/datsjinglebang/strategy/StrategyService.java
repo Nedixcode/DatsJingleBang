@@ -30,9 +30,17 @@ public class StrategyService {
     private final Map<String, int[]> escapeFromPos = new HashMap<>(); // Откуда убегаем
     private final Map<String, int[]> escapeDirection = new HashMap<>(); // Направление убегания
 
+    // НОВЫЕ ПОЛЯ ДЛЯ ОБРАБОТКИ ЗАМКНУТЫХ ПРОСТРАНСТВ
+    private final Map<String, Integer> lastSuccessfulBombTick = new HashMap<>();
+    private final Map<String, Integer> stuckCounter = new HashMap<>();
+    private final Map<String, int[]> lastPositions = new HashMap<>();
+    private final Map<String, Integer> samePositionCounter = new HashMap<>();
+
     // Константы
     private static final int BOMB_RADIUS = 1;      // Радиус взрыва бомбы (только соседние клетки)
     private static final int BOMBER_VISION = 5;    // Радиус обзора бомбера (5 клеток)
+    private static final int STUCK_THRESHOLD_TICKS = 10; // 5 секунд при 2 тика в секунду = 10 тиков
+    private static final int SAME_POSITION_THRESHOLD = 5; // 2.5 секунд на одном месте
 
     public MoveRequest decideMove(ArenaResponse arena, BoosterResponse boosters) {
         tickCounter++;
@@ -80,6 +88,17 @@ public class StrategyService {
                 continue;
             }
 
+            // НОВАЯ ПРОВЕРКА: Если бомбер застрял в замкнутом пространстве
+            if (isBomberStuckInEnclosedSpace(bomber, arena)) {
+                log.info("🚨 Bomber {} is STUCK in enclosed space! Forcing bomb placement", bomber.id);
+                MoveBomber forcedBomb = tryForceBombInEnclosedSpace(bomber, arena);
+                if (forcedBomb != null) {
+                    commands.add(forcedBomb);
+                    logBomberAction(bomber, forcedBomb);
+                    continue;
+                }
+            }
+
             MoveBomber command = createSmartBombCommand(bomber, arena);
             if (command != null) {
                 commands.add(command);
@@ -92,6 +111,191 @@ public class StrategyService {
         }
 
         return new MoveRequest(commands);
+    }
+
+    // НОВЫЙ МЕТОД: Проверяет, застрял ли бомбер в замкнутом пространстве
+    private boolean isBomberStuckInEnclosedSpace(Bomber bomber, ArenaResponse arena) {
+        String bomberId = bomber.id;
+        int[] currentPos = bomber.pos;
+
+        // Проверяем, давно ли бомбер стоит на одном месте
+        int[] lastPos = lastPositions.get(bomberId);
+        if (lastPos != null &&
+                lastPos[0] == currentPos[0] && lastPos[1] == currentPos[1]) {
+            int samePosCount = samePositionCounter.getOrDefault(bomberId, 0) + 1;
+            samePositionCounter.put(bomberId, samePosCount);
+
+            // Если стоит на одном месте дольше порога
+            if (samePosCount > SAME_POSITION_THRESHOLD) {
+                // Проверяем, мало ли доступных направлений
+                int availableDirections = countAvailableDirections(currentPos, arena);
+                if (availableDirections <= 2) { // В замкнутом пространстве обычно 1-2 выхода
+                    log.debug("Bomber {} stuck in same position for {} ticks with {} available directions",
+                            bomberId, samePosCount, availableDirections);
+                    return true;
+                }
+            }
+        } else {
+            // Сбрасываем счетчик при движении
+            lastPositions.put(bomberId, currentPos);
+            samePositionCounter.put(bomberId, 0);
+        }
+
+        // Проверяем, давно ли не ставил бомбу
+        int lastBombTime = lastSuccessfulBombTick.getOrDefault(bomberId, 0);
+        int ticksSinceLastBomb = tickCounter - lastBombTime;
+
+        if (ticksSinceLastBomb > STUCK_THRESHOLD_TICKS) {
+            // Проверяем окружение
+            int availableDirections = countAvailableDirections(currentPos, arena);
+            boolean isEnclosed = availableDirections <= 1; // Тупик
+
+            if (isEnclosed) {
+                int stuckCount = stuckCounter.getOrDefault(bomberId, 0);
+                stuckCounter.put(bomberId, stuckCount + 1);
+
+                log.info("⚠️ Bomber {} in enclosed space for {} ticks (available directions: {})",
+                        bomberId, ticksSinceLastBomb, availableDirections);
+                return true;
+            } else {
+                stuckCounter.put(bomberId, 0);
+            }
+        }
+
+        return false;
+    }
+
+    // НОВЫЙ МЕТОД: Считает доступные направления для движения
+    private int countAvailableDirections(int[] pos, ArenaResponse arena) {
+        int count = 0;
+        int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
+
+        for (int[] dir : directions) {
+            int newX = pos[0] + dir[0];
+            int newY = pos[1] + dir[1];
+
+            if (isValidCell(newX, newY, arena) &&
+                    !isObstacle(newX, newY, arena) &&
+                    !isOnBomb(new int[]{newX, newY}, arena)) {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    // НОВЫЙ МЕТОД: Пытается принудительно поставить бомбу в замкнутом пространстве
+    private MoveBomber tryForceBombInEnclosedSpace(Bomber bomber, ArenaResponse arena) {
+        int[] currentPos = bomber.pos;
+
+        // Проверяем базовые условия
+        if (bombCooldown.containsKey(bomber.id) && bombCooldown.get(bomber.id) > 0) {
+            log.debug("Bomber {}: Cooldown active, cannot force bomb", bomber.id);
+            return tryFindEscapeRoute(bomber, arena);
+        }
+        if (bomber.bombs_available <= 0) {
+            log.debug("Bomber {}: No bombs available, trying to escape", bomber.id);
+            return tryFindEscapeRoute(bomber, arena);
+        }
+        if (isOnBomb(currentPos, arena)) {
+            log.debug("Bomber {}: Already on bomb, trying to escape", bomber.id);
+            return tryFindEscapeRoute(bomber, arena);
+        }
+        if (isNextToBomb(currentPos, arena)) {
+            log.debug("Bomber {}: Next to bomb, trying to escape", bomber.id);
+            return tryFindEscapeRoute(bomber, arena);
+        }
+
+        // В замкнутом пространстве ищем любую стену для разрушения
+        // Проверяем, есть ли стены рядом
+        int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
+        for (int[] dir : directions) {
+            int checkX = currentPos[0] + dir[0];
+            int checkY = currentPos[1] + dir[1];
+
+            if (isWall(checkX, checkY, arena)) {
+                // Нашли стену рядом - ставим бомбу
+                log.info("💥 Bomber {} FORCING BOMB in enclosed space next to wall at ({},{})",
+                        bomber.id, checkX, checkY);
+                lastSuccessfulBombTick.put(bomber.id, tickCounter);
+                stuckCounter.put(bomber.id, 0);
+                samePositionCounter.put(bomber.id, 0);
+
+                return plantBombAndEscapeSafely(bomber, arena);
+            }
+        }
+
+        // Если стен нет рядом, ищем ближайшую стену
+        int[] nearestWall = findNearestWallInEnclosedSpace(currentPos, arena);
+        if (nearestWall != null) {
+            log.info("🚶 Bomber {} moving to nearest wall in enclosed space at ({},{})",
+                    bomber.id, nearestWall[0], nearestWall[1]);
+            return moveToTarget(bomber, nearestWall, arena);
+        }
+
+        // Если стен вообще нет, пытаемся найти выход
+        return tryFindEscapeRoute(bomber, arena);
+    }
+
+    // НОВЫЙ МЕТОД: Ищет ближайшую стену в замкнутом пространстве
+    private int[] findNearestWallInEnclosedSpace(int[] from, ArenaResponse arena) {
+        if (arena.arena == null || arena.arena.obstacles == null) return null;
+
+        // В замкнутом пространстве ищем стену в радиусе 2 клеток
+        int[] nearestWall = null;
+        int minDistance = Integer.MAX_VALUE;
+        int maxSearchRadius = 2;
+
+        for (List<Integer> wall : arena.arena.obstacles) {
+            if (wall.size() < 2) continue;
+
+            int wallX = wall.get(0);
+            int wallY = wall.get(1);
+
+            int distance = Math.abs(wallX - from[0]) + Math.abs(wallY - from[1]);
+
+            if (distance <= maxSearchRadius && distance < minDistance) {
+                // В замкнутом пространстве предполагаем, что путь есть
+                minDistance = distance;
+                nearestWall = new int[]{wallX, wallY};
+            }
+        }
+
+        return nearestWall;
+    }
+
+    // НОВЫЙ МЕТОД: Пытается найти путь для выхода из замкнутого пространства
+    private MoveBomber tryFindEscapeRoute(Bomber bomber, ArenaResponse arena) {
+        int[] currentPos = bomber.pos;
+
+        // Ищем любое доступное направление
+        int[][] directions = {{1,0},{-1,0},{0,1},{0,-1}};
+        List<int[]> availableMoves = new ArrayList<>();
+
+        for (int[] dir : directions) {
+            int newX = currentPos[0] + dir[0];
+            int newY = currentPos[1] + dir[1];
+
+            if (isValidCell(newX, newY, arena) &&
+                    !isObstacle(newX, newY, arena) &&
+                    !isOnBomb(new int[]{newX, newY}, arena)) {
+                availableMoves.add(new int[]{newX, newY});
+            }
+        }
+
+        if (!availableMoves.isEmpty()) {
+            // Выбираем случайное направление
+            int[] target = availableMoves.get(random.nextInt(availableMoves.size()));
+            log.info("🧭 Bomber {} trying to escape enclosed space to ({},{})",
+                    bomber.id, target[0], target[1]);
+            return moveToTarget(bomber, target, arena);
+        }
+
+        // Если нет доступных ходов, остаемся на месте
+        log.warn("⚠️ Bomber {} completely trapped in enclosed space!", bomber.id);
+        List<List<Integer>> path = new ArrayList<>();
+        path.add(Arrays.asList(currentPos[0], currentPos[1]));
+        return new MoveBomber(bomber.id, path, new ArrayList<>());
     }
 
     private void updateCooldown(String bomberId) {
@@ -117,6 +321,9 @@ public class StrategyService {
                 preferredDirection.put(bomber.id, random.nextInt(4));
                 lastBombTick.put(bomber.id, 0);
                 escapeTicks.put(bomber.id, 0);
+                lastSuccessfulBombTick.put(bomber.id, 0); // Инициализация
+                stuckCounter.put(bomber.id, 0); // Инициализация
+                samePositionCounter.put(bomber.id, 0); // Инициализация
 
                 log.info("🎯 Bomber {} assigned to group {}, direction {}",
                         bomber.id, bomberGroup.get(bomber.id),
@@ -144,6 +351,7 @@ public class StrategyService {
         if (shouldPlantStrategicBomb(bomber, arena)) {
             lastAction.put(bomber.id, "STRATEGIC_BOMB");
             lastBombTick.put(bomber.id, tickCounter);
+            lastSuccessfulBombTick.put(bomber.id, tickCounter); // Обновляем время успешной бомбы
             return plantBombAndEscapeSafely(bomber, arena);
         }
 
@@ -441,6 +649,11 @@ public class StrategyService {
         // Запоминаем, что мы убегаем от бомбы
         escapeTicks.put(bomber.id, 4); // Убегаем 4 тика
         escapeFromPos.put(bomber.id, currentPos);
+
+        // Обновляем время последней успешной бомбы
+        lastSuccessfulBombTick.put(bomber.id, tickCounter);
+        stuckCounter.put(bomber.id, 0);
+        samePositionCounter.put(bomber.id, 0);
 
         // Определяем направление убегания (первый шаг пути)
         if (escapePath.size() > 1) {
@@ -1638,6 +1851,10 @@ public class StrategyService {
         escapeTicks.keySet().removeIf(id -> !aliveBomberIds.contains(id));
         escapeFromPos.keySet().removeIf(id -> !aliveBomberIds.contains(id));
         escapeDirection.keySet().removeIf(id -> !aliveBomberIds.contains(id));
+        lastSuccessfulBombTick.keySet().removeIf(id -> !aliveBomberIds.contains(id));
+        stuckCounter.keySet().removeIf(id -> !aliveBomberIds.contains(id));
+        lastPositions.keySet().removeIf(id -> !aliveBomberIds.contains(id));
+        samePositionCounter.keySet().removeIf(id -> !aliveBomberIds.contains(id));
     }
 
     // ДОПОЛНЕНИЕ: Метод для обновления предпочтительного направления

@@ -100,7 +100,7 @@ public class GameLoopService {
                 .doOnSuccess(arena -> log.info("[{}] │ ✓ GET /arena: code={}, player={}, round={}",
                         tickId, arena.code, arena.player, arena.round))
                 .doOnError(e -> log.error("[{}] │ ✗ GET /arena failed: {}", tickId, e.getMessage()))
-                .delayElement(Duration.ofMillis(500))
+                .delayElement(Duration.ofMillis(300))
                 .flatMap(arena -> {
                     if (arena.code != 0) {
                         log.info("[{}] │ Game not active (code={}), skipping booster/move",
@@ -126,7 +126,7 @@ public class GameLoopService {
                                 checkAndPurchaseBooster(boosters, tickId);
                             })
                             .doOnError(e -> log.error("[{}] │ ✗ GET /booster failed: {}", tickId, e.getMessage()))
-                            .delayElement(Duration.ofMillis(500))
+                            .delayElement(Duration.ofMillis(300))
                             .flatMap(boosters -> {
                                 // Шаг 3: Генерируем команды
                                 MoveRequest moveRequest = strategyService.decideMove(arena, boosters);
@@ -143,11 +143,11 @@ public class GameLoopService {
                                                     tickId, totalRequests.incrementAndGet(), moveRequest.getBombers().size()))
                                             .doOnSuccess(v -> log.info("[{}] │ ✓ POST /move successful", tickId))
                                             .doOnError(e -> log.error("[{}] │ ✗ POST /move failed: {}", tickId, e.getMessage()))
-                                            .delayElement(Duration.ofMillis(500));
+                                            .delayElement(Duration.ofMillis(300));
                                 } else {
                                     log.info("[{}] │ No commands to send", tickId);
                                     // Все равно ждем 500ms для сохранения ритма
-                                    return Mono.delay(Duration.ofMillis(350)).then();
+                                    return Mono.delay(Duration.ofMillis(300)).then();
                                 }
                             });
                 })
@@ -293,15 +293,15 @@ public class GameLoopService {
         if (boosterType == null) return 1;
 
         switch (boosterType.toLowerCase()) {
-            case "bombs":
+            case "armor":
                 return 10; // Самый высокий приоритет - больше бомб
             case "speed":
                 return 9;  // Скорость
-            case "bomb_range":
+            case "bombs":
                 return 8;  // Радиус взрыва
             case "view":
                 return 7;  // Обзор
-            case "armor":
+            case "bomb_range":
                 return 6;  // Броня
             case "bomb_delay":
                 return 5;  // Задержка бомбы
